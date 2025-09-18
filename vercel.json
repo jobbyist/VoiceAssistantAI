@@ -1,0 +1,15 @@
+{
+  // Vercel configuration for deploying the AI voice assistant.  Note that
+  // persistent WebSocket connections are only supported in Vercel’s edge
+  // runtime (beta) or by using external platforms.  If WebSockets are not
+  // supported the media stream may not function correctly.
+  "version": 2,
+  "builds": [
+    { "src": "index.js", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "/incoming-call", "dest": "/index.js" },
+    { "src": "/media-stream", "dest": "/index.js" },
+    { "src": "/", "dest": "/index.js" }
+  ]
+}
