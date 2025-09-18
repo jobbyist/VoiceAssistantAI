@@ -5,6 +5,7 @@ import fastifyWs from '@fastify/websocket';
 import { z } from 'zod';
 import nodemailer from 'nodemailer';
 import { Twilio } from 'twilio';
+import Stripe from 'stripe';
 // Import OpenAI realtime agent classes and Twilio transport layer.  These packages
 // are not bundled with this repository by default – see package.json for
 // dependencies and install them locally via `npm install`.
@@ -23,6 +24,7 @@ const {
   PORT,
   OPENAI_API_KEY,
   LAW_FIRM_EMAIL,
+  ESCALATION_EMAIL,
   SMTP_HOST,
   SMTP_PORT,
   SMTP_USER,
@@ -31,6 +33,15 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_FROM_NUMBER,
+  // Calendly configuration
+  CALENDLY_PERSONAL_ACCESS_TOKEN,
+  CALENDLY_FREE_PHONE_LINK,
+  CALENDLY_FREE_ZOOM_LINK,
+  CALENDLY_PAID_ZOOM_LINK,
+  CALENDLY_PAID_IN_PERSON_LINK,
+  // Stripe configuration
+  STRIPE_SECRET_KEY,
+  STRIPE_PRICE_ID_60_MIN,
 } = process.env;
 
 // Basic sanity check for the API key.  If the OPENAI_API_KEY is missing the
@@ -63,6 +74,15 @@ const transporter = nodemailer.createTransport({
 let twilioClient = null;
 if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   twilioClient = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+}
+
+// Optional Stripe client used to generate payment links for paid consultations.
+// The Stripe secret key and price ID must be provided via environment
+// variables.  When configured, the `book_consultation` tool will create
+// checkout links for the $500 consultation.
+let stripeClient = null;
+if (STRIPE_SECRET_KEY) {
+  stripeClient = new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2022-11-15' });
 }
 
 /*
@@ -106,6 +126,148 @@ const scheduleAppointmentTool = tool({
   },
 });
 
+/*
+ * Book a consultation with the legal team.  Callers may choose between a
+ * free 15‑minute consultation (over the phone or via Zoom) or a paid
+ * one‑hour consultation (Zoom or in person) for $500.  When called, this
+ * tool sends confirmation emails to both the client and the firm, creates a
+ * Calendly scheduling link, and optionally generates a Stripe checkout
+ * session for paid consultations.  The law firm can configure the
+ * appropriate Calendly event links and Stripe price IDs via environment
+ * variables.
+ */
+const bookConsultationTool = tool({
+  name: 'book_consultation',
+  description:
+    'Book a consultation for the caller.  Clients can choose a free 15‑minute call (phone or Zoom) or a 1‑hour session (Zoom or in person) that costs $500.',
+  parameters: z.object({
+    consultationType: z
+      .enum([
+        'free_phone',
+        'free_zoom',
+        'paid_zoom',
+        'paid_in_person',
+      ])
+      .describe(
+        'Type of consultation requested: "free_phone" for a 15‑minute phone call, "free_zoom" for a 15‑minute Zoom call, "paid_zoom" for a 1‑hour Zoom consultation, or "paid_in_person" for a 1‑hour in‑person meeting.  Paid options cost $500.'
+      ),
+    date: z.string().describe('Preferred appointment date in YYYY‑MM‑DD format.'),
+    time: z.string().describe('Preferred appointment time (e.g. "15:00" or "3pm").'),
+    clientName: z
+      .string()
+      .describe('Full name of the client scheduling the consultation.'),
+    clientPhone: z
+      .string()
+      .describe('Best phone number for reaching the client.'),
+    clientEmail: z
+      .string()
+      .describe('Client email address for sending confirmation and payment links.'),
+  }),
+  execute: async ({
+    consultationType,
+    date,
+    time,
+    clientName,
+    clientPhone,
+    clientEmail,
+  }) => {
+    // Determine the appropriate Calendly link for the requested consultation
+    let calendlyLink;
+    let paid = false;
+    switch (consultationType) {
+      case 'free_phone':
+        calendlyLink = CALENDLY_FREE_PHONE_LINK;
+        break;
+      case 'free_zoom':
+        calendlyLink = CALENDLY_FREE_ZOOM_LINK;
+        break;
+      case 'paid_zoom':
+        calendlyLink = CALENDLY_PAID_ZOOM_LINK;
+        paid = true;
+        break;
+      case 'paid_in_person':
+        calendlyLink = CALENDLY_PAID_IN_PERSON_LINK;
+        paid = true;
+        break;
+      default:
+        calendlyLink = CALENDLY_FREE_PHONE_LINK;
+    }
+    let paymentUrl = null;
+    if (paid && stripeClient && STRIPE_PRICE_ID_60_MIN) {
+      try {
+        // Create a Stripe Payment Link for the 1‑hour paid consultation.
+        const link = await stripeClient.paymentLinks.create({
+          line_items: [
+            {
+              price: STRIPE_PRICE_ID_60_MIN,
+              quantity: 1,
+            },
+          ],
+          metadata: {
+            client_name: clientName,
+            client_email: clientEmail,
+          },
+        });
+        paymentUrl = link.url;
+      } catch (error) {
+        console.error('Error creating Stripe payment link:', error);
+      }
+    }
+    // Construct the consultation description
+    const consultationDescription =
+      consultationType === 'free_phone'
+        ? 'a free 15‑minute phone consultation'
+        : consultationType === 'free_zoom'
+        ? 'a free 15‑minute Zoom consultation'
+        : consultationType === 'paid_zoom'
+        ? 'a paid 1‑hour Zoom consultation'
+        : 'a paid 1‑hour in‑person consultation';
+    // Build email for the client
+    const emailSubject = `Your consultation request with Pritpal Singh Law`;
+    let emailBody = `Hello ${clientName},\n\nThank you for choosing the Law Offices of Pritpal Singh for your real‑estate matter. You have requested ${consultationDescription} on ${date} at ${time}.\n\n`;
+    if (calendlyLink) {
+      emailBody += `To confirm your appointment, please use the following link to select a time on our calendar: ${calendlyLink}\n\n`;
+    }
+    if (paymentUrl) {
+      emailBody += `This consultation requires payment. Please use the following secure link to complete your $500 payment: ${paymentUrl}\n\n`;
+    }
+    emailBody += `If you have any questions or need to adjust your appointment, please reply to this email or call our office.\n\nWe look forward to speaking with you.\n\nBest regards,\nThe Law Offices of Pritpal Singh`;
+    // Send confirmation email to the client
+    try {
+      await transporter.sendMail({
+        from: SMTP_USER,
+        to: clientEmail,
+        subject: emailSubject,
+        text: emailBody,
+      });
+    } catch (error) {
+      console.error('Error sending consultation confirmation email:', error);
+    }
+    // Notify the law firm of the booking request
+    const internalSubject = `New consultation request from ${clientName}`;
+    let internalBody = `Client Name: ${clientName}\nPhone: ${clientPhone}\nEmail: ${clientEmail}\nRequested Type: ${consultationDescription}\nPreferred Date: ${date}\nPreferred Time: ${time}\n`;
+    if (paymentUrl) {
+      internalBody += `Payment link: ${paymentUrl}\n`;
+    }
+    if (calendlyLink) {
+      internalBody += `Calendly link: ${calendlyLink}\n`;
+    }
+    if (LAW_FIRM_EMAIL) {
+      try {
+        await transporter.sendMail({
+          from: SMTP_USER,
+          to: LAW_FIRM_EMAIL,
+          subject: internalSubject,
+          text: internalBody,
+        });
+      } catch (error) {
+        console.error('Error sending internal consultation notification:', error);
+      }
+    }
+    return `Thank you, ${clientName}. I’ve recorded your request for ${consultationDescription} on ${date} at ${time}. A confirmation has been sent to your email${paymentUrl ? ' with a payment link' : ''}.`;
+  },
+});
+
 // Process a payment for legal services.  This tool demonstrates how you might
 // integrate with a payment gateway.  In this sample the payment details are
 // emailed to the law firm’s billing department; no real payment is taken.
@@ -146,23 +308,54 @@ const processPaymentTool = tool({
 const escalatetoHumanTool = tool({
   name: 'escalate_to_human',
   description:
-    'Escalate the conversation to a human when the caller’s request requires legal advice or specialised assistance.',
+    'Escalate the conversation to a human when the caller’s request requires legal advice or specialised assistance.  Collect contact details and preferred follow‑up information before handing off.',
   parameters: z.object({
     reason: z
       .string()
       .describe('Reason for requesting human assistance.'),
+    clientName: z
+      .string()
+      .describe('Full name of the caller requesting escalation.'),
+    clientPhone: z
+      .string()
+      .describe('Best phone number for reaching the caller.'),
+    clientEmail: z
+      .string()
+      .describe('Email address for the caller.'),
+    preferredContactDay: z
+      .string()
+      .describe('Preferred day of the week for a follow‑up call (e.g. "Monday" or "any day").'),
+    preferredContactTime: z
+      .string()
+      .describe('Preferred time of day for follow‑up (e.g. "morning", "afternoon", "3pm").'),
+    preferredContactMedium: z
+      .enum(['phone', 'email'])
+      .describe('Preferred method to reach the caller (phone or email).'),
   }),
-  execute: async ({ reason }) => {
-    // Notify the law firm via email
-    const subject = 'Call escalation requested';
-    const body = `A caller requested human assistance: ${reason}`;
-    if (LAW_FIRM_EMAIL) {
-      await transporter.sendMail({
-        from: SMTP_USER,
-        to: LAW_FIRM_EMAIL,
-        subject,
-        text: body,
-      });
+  execute: async ({
+    reason,
+    clientName,
+    clientPhone,
+    clientEmail,
+    preferredContactDay,
+    preferredContactTime,
+    preferredContactMedium,
+  }) => {
+    // Compose escalation details
+    const subject = `Escalation request from ${clientName}`;
+    const body = `A caller has requested human assistance for the following reason: ${reason}.\n\nCaller Details:\nName: ${clientName}\nPhone: ${clientPhone}\nEmail: ${clientEmail}\nPreferred contact day: ${preferredContactDay}\nPreferred contact time: ${preferredContactTime}\nPreferred contact medium: ${preferredContactMedium}\n\nPlease follow up with the client as soon as possible.`;
+    const recipient = ESCALATION_EMAIL || LAW_FIRM_EMAIL;
+    if (recipient) {
+      try {
+        await transporter.sendMail({
+          from: SMTP_USER,
+          to: recipient,
+          subject,
+          text: body,
+        });
+      } catch (error) {
+        console.error('Error sending escalation email:', error);
+      }
     }
     // Optionally dial a human representative using Twilio
     if (twilioClient && TWILIO_FROM_NUMBER && HUMAN_PHONE_NUMBER) {
@@ -176,7 +369,7 @@ const escalatetoHumanTool = tool({
         console.error('Error placing outbound call for escalation:', error);
       }
     }
-    return 'Connecting you to a human representative for further assistance.';
+    return 'Thank you. I will have someone from our team follow up with you soon.';
   },
 });
 
@@ -190,12 +383,18 @@ const escalatetoHumanTool = tool({
 const agent = new RealtimeAgent({
   name: 'Pritpal Singh Law AI Assistant',
   instructions: `
-You are an AI voice assistant for the Law Offices of Pritpal Singh.  
-You can provide general information about California property law, assist callers with scheduling consultations, and help process payments for legal fees.  
-Never provide specific legal advice or guarantee legal outcomes.  If a caller requests advice or information that requires legal judgement, use the \"escalate_to_human\" tool.  
-When handling a scheduling or payment request, confirm details with the caller before proceeding.  
-Use polite and concise language at all times.`,
-  tools: [scheduleAppointmentTool, processPaymentTool, escalatetoHumanTool],
+You are an AI voice assistant for the Law Offices of Pritpal Singh.  Your role is to greet callers, collect minimal information necessary to assist them, provide concise and neutral information about California real‑estate law, offer to book consultations, process payments for paid consultations, and hand off to a human when needed.  Follow these guidelines:
+
+• **Tone and persona:** Maintain a warm, professional and concise tone. Pronounce “Pritpal Singh” as “Prit‑pall Sing.” Speak plainly and avoid legal jargon unless the caller uses it first. Always include the disclaimer “This conversation does not create an attorney‑client relationship and is for informational purposes only.”【213820349183228†L29-L38】【213820349183228†L321-L324】
+• **Language support:** Detect the caller’s language (English, Spanish or Mandarin) and respond in the same language. Translate your responses if necessary and be mindful of cultural politeness.  If you are unsure which language the caller is using, politely ask them to continue in English, Spanish, or Mandarin.
+• **Practice areas:** You can answer general questions about California real‑estate law, including landlord/tenant matters, premises liability, boundary disputes, quiet title actions, adverse possession, easements and encroachments, mortgage fraud, foreclosure defense, contract drafting and review, purchase agreements, closings, broker disputes, financing documents and title and escrow issues【213820349183228†L42-L139】.  Summarise the service: “We assist with [Short Name] in several ways, including [Key Talking Points]”【213820349183228†L158-L169】.  Provide neutral information drawn from the firm’s website and the training script, but never offer definitive legal advice【213820349183228†L36-L38】.
+• **Appointment booking:** If the caller wishes to schedule a consultation, offer the choice of a **free 15‑minute consultation** (by phone or via Zoom) or a **paid 1‑hour consultation** (via Zoom or in person) that costs $500.  Use the 'book_consultation' tool to collect the caller’s full name, phone number, email address, preferred date and time, and consultation type.  For paid consultations, inform the caller that a secure payment link will be sent via email and that payment is required to confirm the booking.  Confirm the caller’s details before invoking the tool and reassure them that their information will only be used for scheduling purposes【213820349183228†L216-L239】.
+• **Payments:** When a caller asks to pay an outstanding legal fee or deposit, use the 'process_payment' tool.  Record the amount, the caller’s name and the payment method (e.g. Visa, Mastercard, bank transfer).  Acknowledge the payment politely and confirm that a receipt will be sent shortly.
+• **Escalation:** If the caller requests legal advice, insists on speaking with an attorney immediately, has an emergency (such as a sale occurring soon), or presents a complex multi‑practice matter, use the 'escalate_to_human' tool【213820349183228†L239-L244】.  Before escalating, collect the caller’s name, phone number, email, preferred day and time to be contacted, and whether they prefer a call or an email.  Explain that a human will follow up as soon as possible.
+• **Data privacy:** Only collect information necessary to schedule or triage the matter.  If the caller asks why details are needed, explain that the firm collects only what is necessary to book the consultation and that their data will not be shared outside the firm without consent【213820349183228†L225-L228】.  Always confirm personal details back to the caller before ending the call【213820349183228†L39-L40】.
+• **Call closure:** At the end of the conversation, thank the caller for contacting the Law Offices of Pritpal Singh and wish them a good day.  Include the disclaimer if it has not been stated yet.  Do not exceed the scope of informational assistance.
+`,
+  tools: [bookConsultationTool, scheduleAppointmentTool, processPaymentTool, escalatetoHumanTool],
 });
 
 /*
@@ -229,8 +428,11 @@ fastify.register(fastifyWs);
 
 // Greeting that plays when the call is first answered.  Using an Amazon Polly
 // neural voice via Twilio provides a natural-sounding greeting.
+// Greeting that plays when the call is first answered.  This wording follows
+// the training script: it states the firm name, identifies the virtual
+// receptionist, and invites the caller to describe their real‑estate matter.
 const WELCOME_GREETING =
-  'Thank you for calling the Law Offices of Pritpal Singh. I am an AI assistant. How may I help you today?';
+  'LAW OFFICES OF PRITPAL SINGH—this is the virtual receptionist. How can I assist you with your California real‑estate matter today?';
 
 // Webhook invoked by Twilio when an incoming call is received.  Respond with
 // TwiML to greet the caller and initiate a media stream over WebSocket.  The
