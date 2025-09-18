@@ -9,7 +9,7 @@
     "dev": "nodemon index.js"
   },
   "engines": {
-    "node": "18.20.4"
+    "node": "20.x"
   },
   "dependencies": {
     "@fastify/formbody": "^7.4.0",
