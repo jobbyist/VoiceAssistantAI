@@ -1,6 +1,3 @@
-"engines": { 
-  "node": "18.20.4" 
-},
 {
   "name": "law-voice-assistant",
   "version": "1.0.0",
