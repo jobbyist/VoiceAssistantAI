@@ -9,7 +9,9 @@ import Stripe from 'stripe';
 // Import OpenAI realtime agent classes and Twilio transport layer.  These packages
 // are not bundled with this repository by default – see package.json for
 // dependencies and install them locally via `npm install`.
-import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents';
+// correct
+import { RealtimeAgent, RealtimeSession } from '@openai/agents/realtime';
+import { tool } from '@openai/agents';
 import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions';
 
 // Load environment variables from the `.env` file.  See `.env.example` for the
