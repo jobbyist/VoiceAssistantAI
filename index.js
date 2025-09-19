@@ -4,7 +4,7 @@ import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 import { z } from 'zod';
 import nodemailer from 'nodemailer';
-import { Twilio } from 'twilio';
++ import twilio from 'twilio';
 import Stripe from 'stripe';
 // Import OpenAI realtime agent classes and Twilio transport layer.  These packages
 // are not bundled with this repository by default – see package.json for
@@ -75,7 +75,8 @@ const transporter = nodemailer.createTransport({
 // email notifications.
 let twilioClient = null;
 if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
-  twilioClient = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+   // twilio CJS default export is a factory function: client = twilio(sid, token)
+twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 }
 
 // Optional Stripe client used to generate payment links for paid consultations.
